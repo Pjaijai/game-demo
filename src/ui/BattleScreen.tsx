@@ -12,6 +12,8 @@ interface Props {
   state: BattleState
   onChange: (next: BattleState) => void
   onRestart: () => void
+  /** 戰役模式下按鈕文字改成「回到地圖」 */
+  finishLabel?: string
 }
 
 function Portrait({ c, small }: { c: Combatant; small?: boolean }) {
@@ -44,7 +46,7 @@ function Bars({ c }: { c: Combatant }) {
   )
 }
 
-export function BattleScreen({ state, onChange, onRestart }: Props) {
+export function BattleScreen({ state, onChange, onRestart, finishLabel }: Props) {
   const order = useMemo(() => previewOrder(state, 6), [state])
   const byId = useMemo(
     () => new Map(state.combatants.map((c) => [c.id, c])),
@@ -210,7 +212,7 @@ export function BattleScreen({ state, onChange, onRestart }: Props) {
             {state.phase === 'fled' ? '撤退 — 這一戰不算數' : null}
           </h2>
           <button className="btn btn--primary" onClick={onRestart}>
-            再打一次
+            {finishLabel ?? '再打一次'}
           </button>
         </section>
       )}

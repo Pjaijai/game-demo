@@ -1,98 +1,144 @@
-import { useState } from 'react'
+/**
+ * 把地圖層與卡牌層接起來。
+ *
+ *   地圖：將 vs 將 → 建立 Combatant → 卡牌戰
+ *   卡牌戰結束 → 換算成傷勢與兵力損失 → 寫回地圖
+ *
+ * 兩層之間唯一的資料流就是這裡：帶的兵種與兵力檔位決定護甲與兵種牌，
+ * 牌樹等級決定手牌，戰果決定傷勢鏈。
+ */
+import { useCallback, useEffect, useState } from 'react'
 import { createBattle } from './core/battle/battle'
-import type { BattleState } from './core/battle/types'
-import { makeCombatant, type Loadout } from './data/generals'
+import type { BattleState, TroopTier } from './core/battle/types'
+import {
+  applyBattleOutcome,
+  unitById,
+  type BattleOutcome,
+} from './core/map/game'
+import type { MapState, MapUnit } from './core/map/types'
+import { GENERALS, makeCombatant } from './data/generals'
+import { createScenario } from './data/scenario'
 import { BattleScreen } from './ui/BattleScreen'
+import { MapScreen } from './ui/MapScreen'
 
-type Level = 1 | 2 | 3
-
-interface Setup {
-  heroes: string[]
-  level: Level
+function tierOf(u: MapUnit): TroopTier {
+  if (!u.arm || u.maxTroops === 0) return 'none'
+  const r = u.troops / u.maxTroops
+  if (r >= 0.75) return 'full'
+  if (r >= 0.35) return 'half'
+  return 'broken'
 }
 
-const ARMS: Record<string, '槍' | '馬'> = { 劉備: '槍', 關羽: '馬', 張飛: '槍' }
-
-function start(setup: Setup): BattleState {
-  const players = setup.heroes.map((name) => {
-    const lo: Loadout = { arm: ARMS[name], troopTier: 'full', level: setup.level }
-    return makeCombatant(name, lo)
-  })
-  const boss = makeCombatant('呂布', { arm: '馬', troopTier: 'full' })
-  return createBattle(players, [boss], Math.floor(Math.random() * 1e9))
+function powerOf(u: MapUnit): number {
+  if (!u.general) return 0
+  const def = GENERALS[u.general]
+  if (!def) return 0
+  return def.power - (u.wound === 'wounded' ? 20 : 0)
 }
 
-const ALL_HEROES = ['劉備', '關羽', '張飛']
+/** 從地圖上的參戰單位建立一場卡牌戰 */
+function buildBattle(map: MapState): {
+  battle: BattleState
+  unitByGeneral: Map<string, string>
+} | null {
+  const pending = map.pendingBattle
+  if (!pending) return null
+
+  const unitByGeneral = new Map<string, string>()
+  const toCombatant = (id: string) => {
+    const u = unitById(map, id)
+    if (!u || !u.general) return null
+    unitByGeneral.set(u.general, u.id)
+    return makeCombatant(u.general, {
+      arm: u.arm,
+      troopTier: tierOf(u),
+      level: u.level,
+      wound: u.wound,
+    })
+  }
+
+  const players = pending.playerIds.map(toCombatant).filter((c) => c !== null)
+  const enemies = pending.enemyIds.map(toCombatant).filter((c) => c !== null)
+  if (players.length === 0 || enemies.length === 0) return null
+
+  return {
+    battle: createBattle(players, enemies, Math.floor(Math.random() * 1e9)),
+    unitByGeneral,
+  }
+}
 
 export function App() {
-  const [setup, setSetup] = useState<Setup>({ heroes: ALL_HEROES, level: 1 })
-  const [state, setState] = useState<BattleState | null>(null)
+  const [map, setMap] = useState<MapState>(() => createScenario())
+  const [battle, setBattle] = useState<BattleState | null>(null)
+  const [unitByGeneral, setUnitByGeneral] = useState<Map<string, string>>(new Map())
 
-  if (!state) {
+  // 地圖進入 battle 階段就開場
+  useEffect(() => {
+    if (!map.pendingBattle || battle) return
+    const built = buildBattle(map)
+    if (built) {
+      setBattle(built.battle)
+      setUnitByGeneral(built.unitByGeneral)
+    }
+  }, [map, battle])
+
+  const finishBattle = useCallback(
+    (final: BattleState) => {
+      const playerSide = final.combatants.filter((c) => c.side === 'player')
+      const enemySide = final.combatants.filter((c) => c.side === 'enemy')
+
+      const result: BattleOutcome['result'] =
+        final.phase === 'won' ? 'won' : final.phase === 'fled' ? 'fled' : 'lost'
+
+      // 碾壓判定：戰力差 ≥25 且勝方殘血 ≥70%
+      const winners = result === 'won' ? playerSide : enemySide
+      const losers = result === 'won' ? enemySide : playerSide
+      const sumPower = (side: typeof playerSide) =>
+        side.reduce((n, c) => {
+          const uid = unitByGeneral.get(c.name)
+          const u = uid ? unitById(map, uid) : undefined
+          return n + (u ? powerOf(u) : 0)
+        }, 0)
+      const winnerHp =
+        winners.reduce((n, c) => n + c.hp, 0) /
+        Math.max(1, winners.reduce((n, c) => n + c.maxHp, 0))
+      const crush =
+        result === 'lost' && sumPower(winners) - sumPower(losers) >= 25 && winnerHp >= 0.7
+
+      const outcome: BattleOutcome = {
+        result,
+        crush,
+        bossInvolved: enemySide.some((c) => c.name === '呂布'),
+        survivors: playerSide
+          .map((c) => {
+            const unitId = unitByGeneral.get(c.name)
+            return unitId
+              ? { unitId, hpRatio: c.hp / c.maxHp, alive: c.hp > 0 }
+              : null
+          })
+          .filter((s) => s !== null),
+      }
+
+      setBattle(null)
+      setMap((m) => applyBattleOutcome(m, outcome))
+    },
+    [map, unitByGeneral],
+  )
+
+  if (battle) {
+    const done =
+      battle.phase === 'won' || battle.phase === 'lost' || battle.phase === 'fled'
     return (
-      <div className="setup">
-        <h1>三英戰呂布</h1>
-        <p className="setup__sub">
-          援護規則：一起上陣的武將會進同一場卡牌戰。呂布絕不撤退。
-        </p>
-
-        <div className="setup__group">
-          <label>出戰武將</label>
-          <div className="setup__row">
-            {ALL_HEROES.map((name) => {
-              const on = setup.heroes.includes(name)
-              return (
-                <button
-                  key={name}
-                  className={`pill ${on ? 'pill--on' : ''}`}
-                  onClick={() =>
-                    setSetup((s) => ({
-                      ...s,
-                      heroes: on
-                        ? s.heroes.filter((h) => h !== name)
-                        : ALL_HEROES.filter((h) => h === name || s.heroes.includes(h)),
-                    }))
-                  }
-                >
-                  {name}
-                  <small>{ARMS[name]}兵</small>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-
-        <div className="setup__group">
-          <label>牌樹等級（內政「訓練」解鎖）</label>
-          <div className="setup__row">
-            {([1, 2, 3] as Level[]).map((lv) => (
-              <button
-                key={lv}
-                className={`pill ${setup.level === lv ? 'pill--on' : ''}`}
-                onClick={() => setSetup((s) => ({ ...s, level: lv }))}
-              >
-                Lv{lv}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <button
-          className="btn btn--primary btn--big"
-          disabled={setup.heroes.length === 0}
-          onClick={() => setState(start(setup))}
-        >
-          開戰
-        </button>
-
-        <div className="setup__note">
-          模擬勝率（400 場）：1v1 0% · 2v1 Lv3 約 1% · 3v1 Lv1 11% / Lv2 55% / Lv3 71%
-        </div>
-      </div>
+      <BattleScreen
+        state={battle}
+        onChange={setBattle}
+        onRestart={() => finishBattle(battle)}
+        {...(done ? { finishLabel: '回到地圖' } : {})}
+      />
     )
   }
 
   return (
-    <BattleScreen state={state} onChange={setState} onRestart={() => setState(null)} />
+    <MapScreen state={map} onChange={setMap} onRestart={() => setMap(createScenario())} />
   )
 }
